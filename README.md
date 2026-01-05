@@ -1,58 +1,71 @@
-# RSQL: A SQLite Clone from Scratch in Rust (Still in Development)
+# RSQL: A SQLite Clone from Scratch in Rust
 
-**RSQL** is a lightweight, disk-backed relational database management system (RDBMS). This project explores database internals by implementing a SQL compiler, a Virtual Machine, and a persistent B-Tree storage engine from the ground up.
+**RSQL** is a lightweight, disk-backed relational database management system (RDBMS) built in Rust. This project explores the "magic" of databases by implementing a persistent B-Tree storage engine from the ground up.
 
 ## 🏗️ Architecture
 
 RSQL follows a modular architecture inspired by SQLite’s design:
 
-| Component | Responsibility |
-| --- | --- |
-| **REPL** | The Command Line Interface for user interaction. |
-| **Compiler** | Parses SQL strings into a Virtual Machine instruction set. |
-| **Virtual Machine** | Executes instructions (bytecode) by interacting with the B-Tree layer. |
-| **B-Tree** | Organizes data into 4KB pages for  searching and insertion. |
-| **Pager** | Manages a page cache and handles raw byte I/O with the filesystem. |
+| Component | Responsibility | Status |
+| --- | --- | --- |
+| **REPL** | The Command Line Interface for user interaction. | ✅ Active |
+| **Pager** | Manages 4KB pages and handles raw byte I/O with the filesystem. | ✅ Implemented |
+| **B-Tree** | Organizes data into sorted pages for  searching. | 🚧 In Progress |
+| **Storage** | Uses raw memory pointers for high-performance serialization. | ✅ Implemented |
 
 ---
 
 ## 🛠️ Current Implementation Status
 
-### ✅ Phase 1: The Front-end
+### ✅ Phase 1: The Pager & Persistence
 
-* **REPL:** Implemented a robust loop using `stdin` with colored status/error indicators.
-* **Meta-commands:** Support for `.exit`, `.btree` (visualization), and `.constants`.
-* **SQL Parser:** Sophisticated parsing with support for `insert` and `select`.
+* **Disk-Backed Storage:** Data is no longer volatile. It is saved to `users.db` and persists after the program closes.
+* **4KB Page Logic:** Implemented a standard SQLite-style page size (4096 bytes) to optimize for disk block alignment.
+* **Memory Management:** A custom `Pager` struct handles the loading and flushing of pages between RAM and Disk.
 
-### ✅ Phase 2: The Virtual Machine & Memory
+### ✅ Phase 2: Leaf Node Engine
 
-* **Row Serialization:** Rows are serialized into a compact 291-byte binary format.
-* **Internal Representation:** Uses `Statement` and `StatementType` enums to guide the VM.
-* **Binary Search:** Searches leaf nodes in  time to ensure sorted storage by Primary Key (ID).
+* **Row Serialization:** Efficiently packs integers and text (up to 32 chars) into binary rows.
+* **Sorted Insertion:** Uses **Binary Search** to find the correct insertion slot, maintaining a perfectly sorted index by Primary Key (ID).
+* **Memory Shifting:** Utilizes `ptr::copy` to perform "on-disk surgery," shifting rows to make room for new data while keeping the page sorted.
+* **Duplicate Prevention:** Detects and rejects duplicate IDs before they reach the storage layer.
 
-### ✅ Phase 3: The Back-end (Persistence & B-Tree)
+### 🚧 Phase 3: B-Tree Scaling (Current Goal)
 
-* **Pager:** Implemented a file-backed caching system that reads/writes 4096-byte pages.
-* **B-Tree Leaf Nodes:** Implemented the header/body format for leaf nodes, currently holding up to 13 rows.
-* **B-Tree Internal Nodes:** Implemented internal nodes with a branching factor of 511.
-* **Splitting & Re-rooting:** Root nodes now split and create new internal parents when full.
-* **Recursive Search:** The engine recursively traverses internal nodes to find target leaf pages.
-* **Cursor Abstraction:** A location-agnostic system to navigate the table without exposing memory math.
+* **Node Splitting:** Implementing the logic to split a full 4KB leaf and distribute rows to a new page.
+* **Internal Nodes:** Creating "signpost" nodes that store keys and pointers to child pages.
+* **Root Management:** Moving the root pointer as the tree grows in height.
 
 ---
 
-## 🧪 Technical Achievements
+## 🧪 Technical Achievements & Benchmarks
 
-* **Sorted Storage:** RSQL now automatically sorts records by ID using binary search, regardless of insertion order.
-* **Persistence:** Data is automatically flushed to disk on `.exit` and reloaded upon startup.
-* **Memory Safety:** Utilizes Rust's `ptr::read_unaligned` and `ptr::write_unaligned` to safely handle packed B-Tree metadata.
-* **Duplicate Detection:** Prevents data corruption by rejecting duplicate Primary Keys.
+* ** Search:** Even within a single page, RSQL uses binary search rather than linear scanning to locate records.
+* **Byte-Perfect Alignment:** Uses Rust's unsafe pointer toolkit (`ptr::write_unaligned`) to ensure metadata headers and row data are packed without padding, maximizing storage density.
+* **Persistence Guarantee:** Every successful `insert` command triggers a page flush, ensuring "durability" (the D in ACID).
 
 ---
 
-## 🚀 Future Roadmap
+## 🚀 How to Run
 
-* [ ] **Phase 4:** **Internal Node Splitting:** Currently, RSQL can only split the root; it needs recursive internal splitting to grow indefinitely.
-* [ ] **Phase 5:** **Parent Pointer Updates:** Implementing the logic to update child-to-parent links after a split.
-* [ ] **Phase 6:** **B-Tree Deletion:** Supporting the `DELETE` keyword and merging nodes to recover space.
+1. **Build and Run:**
+```bash
+cargo run
 
+```
+
+
+2. **Commands:**
+* `insert <id> <name> <email>` - Adds a sorted record to the database.
+* `select` - Displays all records currently in the root page.
+* `.exit` - Safely flushes all buffers to disk and closes the file.
+
+
+
+---
+
+## 📈 Roadmap
+
+* [ ] **Recursive B-Tree Search:** Allow `select` to traverse multiple pages.
+* [ ] **Internal Node Implementation:** Support for trees with a height > 1.
+* [ ] **Variable Length Records:** Support for strings longer than 32 bytes using overflow pages.

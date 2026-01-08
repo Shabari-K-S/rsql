@@ -1,211 +1,289 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
-use std::ptr;
+mod btree;
+mod completer;
+mod executor;
+mod pager;
+mod parser;
+mod table;
+mod tokenizer;
 
-const PAGE_SIZE: usize = 4096;
-const TABLE_MAX_PAGES: usize = 100;
-
-// --- Node Header Layout ---
-const NODE_TYPE_OFFSET: usize = 0;
-const IS_ROOT_OFFSET: usize = 1;
-// const PARENT_POINTER_OFFSET: usize = 2; 
-const LEAF_NODE_NUM_CELLS_OFFSET: usize = 6;
-const LEAF_NODE_HEADER_SIZE: usize = 10;
-
-#[derive(Debug, Clone, PartialEq)]
-enum DataType { Integer, Text(u32) }
-
-struct Column {
-    name: String,
-    data_type: DataType,
-    size: usize,
-    offset: usize,
-}
-
-struct Pager {
-    file: File,
-    file_length: u64,
-    num_pages: u32,
-    pages: Vec<Option<Box<[u8; PAGE_SIZE]>>>,
-}
-
-impl Pager {
-    fn open(filename: &str) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).create(true).open(filename)?;
-        let file_length = file.metadata()?.len();
-        let num_pages = (file_length / PAGE_SIZE as u64) as u32;
-        let mut pages = Vec::with_capacity(TABLE_MAX_PAGES);
-        for _ in 0..TABLE_MAX_PAGES { pages.push(None); }
-
-        Ok(Pager { file, file_length, num_pages, pages })
-    }
-
-    fn get_page(&mut self, page_num: usize) -> &mut [u8; PAGE_SIZE] {
-        if self.pages[page_num].is_none() {
-            let mut page = Box::new([0u8; PAGE_SIZE]);
-            let offset = (page_num * PAGE_SIZE) as u64;
-            if offset < self.file_length {
-                let _ = self.file.read_at(&mut *page, offset);
-            }
-            self.pages[page_num] = Some(page);
-        }
-        self.pages[page_num].as_mut().unwrap()
-    }
-
-    fn flush(&mut self, page_num: usize) {
-        if let Some(page) = &self.pages[page_num] {
-            let offset = (page_num * PAGE_SIZE) as u64;
-            self.file.write_at(&**page, offset).expect("Disk write failed");
-        }
-    }
-}
-
-struct Table {
-    pager: Pager,
-    columns: Vec<Column>,
-    row_size: usize,
-    root_page_num: u32,
-}
-
-impl Table {
-    fn new(filename: &str, raw_cols: Vec<(&str, DataType)>) -> Self {
-        let mut columns = Vec::new();
-        let mut current_offset = 0;
-        for (c_name, c_type) in raw_cols {
-            let size = match c_type { DataType::Integer => 4, DataType::Text(s) => s as usize };
-            columns.push(Column { name: c_name.to_string(), data_type: c_type, size, offset: current_offset });
-            current_offset += size;
-        }
-
-        let mut pager = Pager::open(filename).unwrap();
-        if pager.num_pages == 0 {
-            let page = pager.get_page(0);
-            page[NODE_TYPE_OFFSET] = 1; // Leaf
-            page[IS_ROOT_OFFSET] = 1;
-            unsafe { ptr::write_unaligned(page.as_mut_ptr().add(LEAF_NODE_NUM_CELLS_OFFSET) as *mut u32, 0); }
-            pager.num_pages = 1;
-            pager.flush(0);
-        }
-
-        Table { pager, columns, row_size: current_offset, root_page_num: 0 }
-    }
-
-    fn get_num_cells(&mut self, page_num: u32) -> u32 {
-        let page = self.pager.get_page(page_num as usize);
-        // Fixed: Added cast to *const () to satisfy read_unaligned requirements
-        unsafe { ptr::read_unaligned(page.as_ptr().add(LEAF_NODE_NUM_CELLS_OFFSET) as *const () as *const u32) }
-    }
-
-    fn find_leaf_node_slot(&mut self, page_num: u32, id: u32) -> (u32, bool) {
-        let num_cells = self.get_num_cells(page_num);
-        let cell_size = 4 + self.row_size;
-        let page = self.pager.get_page(page_num as usize);
-        
-        let mut min = 0;
-        let mut max = num_cells;
-        while min < max {
-            let mid = (min + max) / 2;
-            let mid_id_ptr = unsafe { page.as_ptr().add(LEAF_NODE_HEADER_SIZE + (mid as usize * cell_size)) };
-            let mid_id = unsafe { ptr::read_unaligned(mid_id_ptr as *const () as *const u32) };
-            if id == mid_id { return (mid, true); }
-            if id < mid_id { max = mid; } else { min = mid + 1; }
-        }
-        (min, false)
-    }
-
-    fn split_and_insert(&mut self, old_page_num: u32, _id: u32, _parts: &[&str]) {
-        let new_page_num = self.pager.num_pages;
-        self.pager.num_pages += 1;
-        
-        println!("Error: Table full. Splitting Leaf Node {} into new page {}...", old_page_num, new_page_num);
-        println!("(B-Tree full split logic is the next development step).");
-    }
-}
+use colored::Colorize;
+use completer::SqlCompleter;
+use executor::{ExecuteResult, Executor};
+use parser::Parser;
+use rustyline::error::ReadlineError;
+use rustyline::{Config, Editor};
+use tokenizer::Tokenizer;
 
 fn main() {
-    let mut table = Table::new("users.db", vec![
-        ("id", DataType::Integer),
-        ("username", DataType::Text(32)),
-        ("email", DataType::Text(32)),
-    ]);
+    let mut executor = Executor::new();
 
-    println!("RSQL B-Tree Shell. Sorted storage + No duplicates.");
+    // Configure rustyline
+    let config = Config::builder()
+        .history_ignore_space(true)
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+
+    let mut rl = Editor::with_config(config).expect("Failed to create editor");
+    rl.set_helper(Some(SqlCompleter::new()));
+
+    // Load history
+    let history_path: std::path::PathBuf = dirs::home_dir()
+        .map(|p| p.join(".rsql_history"))
+        .unwrap_or_else(|| ".rsql_history".into());
+    let _ = rl.load_history(&history_path);
+
+    // Print banner
+    println!(
+        "{}",
+        "╔═══════════════════════════════════════════════════════════╗".cyan()
+    );
+    println!(
+        "{}",
+        "║               RSQL - SQLite Clone in Rust                 ║".cyan()
+    );
+    println!(
+        "{}",
+        "╠═══════════════════════════════════════════════════════════╣".cyan()
+    );
+    println!(
+        "{}",
+        "║  Type SQL commands or .help for available commands        ║".cyan()
+    );
+    println!(
+        "{}",
+        "║  Use ↑↓ for history, Tab for completion                   ║".cyan()
+    );
+    println!(
+        "{}",
+        "╚═══════════════════════════════════════════════════════════╝".cyan()
+    );
+    println!();
 
     loop {
-        print!("rsql > ");
-        io::stdout().flush().unwrap();
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let parts: Vec<&str> = input.trim().split_whitespace().collect();
-        if parts.is_empty() { continue; }
+        let prompt = "rsql> ".green().bold().to_string();
 
-        match parts[0] {
-            "insert" => {
-                if parts.len() < 4 { println!("Usage: insert <id> <user> <email>"); continue; }
-                let id = parts[1].parse::<u32>().unwrap();
-                let (slot, exists) = table.find_leaf_node_slot(table.root_page_num, id);
-                
-                if exists {
-                    println!("Error: Duplicate key {}", id);
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                let input = line.trim();
+                if input.is_empty() {
                     continue;
                 }
 
-                let num_cells = table.get_num_cells(table.root_page_num);
-                let cell_size = 4 + table.row_size;
+                // Add to history
+                let _ = rl.add_history_entry(input);
 
-                if (LEAF_NODE_HEADER_SIZE + (num_cells as usize + 1) * cell_size) > PAGE_SIZE {
-                    table.split_and_insert(table.root_page_num, id, &parts);
+                // Handle meta commands
+                if input.starts_with('.') {
+                    handle_meta_command(input, &mut executor, &mut rl, &history_path);
                     continue;
                 }
 
-                let page = table.pager.get_page(table.root_page_num as usize);
-                let dest = unsafe { page.as_mut_ptr().add(LEAF_NODE_HEADER_SIZE + (slot as usize * cell_size)) };
+                // Parse and execute SQL
+                let mut tokenizer = Tokenizer::new(input);
+                let tokens = tokenizer.tokenize();
 
-                if slot < num_cells {
-                    unsafe { ptr::copy(dest, dest.add(cell_size), (num_cells - slot) as usize * cell_size); }
-                }
+                let mut parser = Parser::new(tokens);
+                match parser.parse() {
+                    Ok(stmt) => {
+                        // Update completer with new table names
+                        match &stmt {
+                            parser::Statement::CreateTable(create) => {
+                                if let Some(helper) = rl.helper_mut() {
+                                    helper.add_table(create.table_name.clone());
+                                }
+                            }
+                            parser::Statement::DropTable(name) => {
+                                if let Some(helper) = rl.helper_mut() {
+                                    helper.remove_table(name);
+                                }
+                            }
+                            _ => {}
+                        }
 
-                unsafe {
-                    ptr::write_unaligned(dest as *mut u32, id);
-                    let row_dest = dest.add(4);
-                    for (i, col) in table.columns.iter().enumerate() {
-                        if col.name == "id" { continue; }
-                        let val = parts.get(i + 1).unwrap_or(&"");
-                        let b = val.as_bytes();
-                        ptr::write_bytes(row_dest.add(col.offset), 0, col.size);
-                        ptr::copy_nonoverlapping(b.as_ptr(), row_dest.add(col.offset), b.len().min(col.size));
+                        match executor.execute(stmt) {
+                            Ok(result) => print_result(result),
+                            Err(e) => println!("{} {}", "Error:".red().bold(), e.red()),
+                        }
                     }
-                }
-                
-                let new_total = num_cells + 1;
-                let page_update = table.pager.get_page(table.root_page_num as usize);
-                unsafe { ptr::write_unaligned(page_update.as_mut_ptr().add(LEAF_NODE_NUM_CELLS_OFFSET) as *mut u32, new_total); }
-                
-                table.pager.flush(table.root_page_num as usize);
-                println!("Inserted.");
-            }
-            "select" => {
-                let num_cells = table.get_num_cells(0);
-                let cell_size = 4 + table.row_size;
-                let page = table.pager.get_page(0);
-                
-                for i in 0..num_cells {
-                    let ptr = unsafe { page.as_ptr().add(LEAF_NODE_HEADER_SIZE + (i as usize * cell_size)) };
-                    let id = unsafe { ptr::read_unaligned(ptr as *const () as *const u32) };
-                    print!("| ID: {:<3} ", id);
-                    
-                    let row_ptr = unsafe { ptr.add(4) };
-                    for col in &table.columns {
-                        if col.name == "id" { continue; }
-                        let buf = unsafe { std::slice::from_raw_parts(row_ptr.add(col.offset), col.size) };
-                        print!("| {:<10} ", String::from_utf8_lossy(buf).trim_matches(char::from(0)));
-                    }
-                    println!("|");
+                    Err(e) => println!("{} {}", "Parse error:".red().bold(), e.red()),
                 }
             }
-            ".exit" => break,
-            _ => println!("Unknown command."),
+            Err(ReadlineError::Interrupted) => {
+                println!("{}", "^C".yellow());
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("{}", "Goodbye!".green());
+                break;
+            }
+            Err(err) => {
+                println!("{} {:?}", "Error:".red(), err);
+                break;
+            }
+        }
+    }
+
+    // Save history
+    let _ = rl.save_history(&history_path);
+
+    // Flush all tables
+    for table in executor.tables.values_mut() {
+        table.pager.flush_all();
+    }
+}
+
+fn handle_meta_command(
+    input: &str,
+    executor: &mut Executor,
+    rl: &mut Editor<SqlCompleter, rustyline::history::DefaultHistory>,
+    history_path: &std::path::Path,
+) {
+    match input {
+        ".exit" | ".quit" => {
+            // Save history before exiting
+            let _ = rl.save_history(history_path);
+            for table in executor.tables.values_mut() {
+                table.pager.flush_all();
+            }
+            println!("{}", "Goodbye!".green());
+            std::process::exit(0);
+        }
+        ".tables" => {
+            if executor.tables.is_empty() {
+                println!("{}", "(no tables)".dimmed());
+            } else {
+                for name in executor.tables.keys() {
+                    println!("  {}", name.yellow());
+                }
+            }
+        }
+        ".schema" => {
+            for (name, table) in &executor.tables {
+                print!("{} {} (", "CREATE TABLE".blue(), name.yellow());
+                let cols: Vec<String> = table
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let type_str = match &c.data_type {
+                            table::DataType::Integer => "INTEGER".to_string(),
+                            table::DataType::Text(size) => format!("TEXT({})", size),
+                        };
+                        format!("{} {}", c.name.cyan(), type_str)
+                    })
+                    .collect();
+                println!("{});", cols.join(", "));
+            }
+        }
+        ".help" => {
+            println!("{}", "Meta Commands:".yellow().bold());
+            println!("  {}  - Show this help", ".help".cyan());
+            println!("  {}  - List all tables", ".tables".cyan());
+            println!("  {}  - Show table schemas", ".schema".cyan());
+            println!("  {}  - Exit the shell", ".exit".cyan());
+            println!();
+            println!("{}", "SQL Commands:".yellow().bold());
+            println!(
+                "  {}",
+                "CREATE TABLE name (col1 INTEGER, col2 TEXT)".dimmed()
+            );
+            println!(
+                "  {}",
+                "INSERT INTO name VALUES (1, 'value', 'value2')".dimmed()
+            );
+            println!("  {}", "SELECT * FROM name".dimmed());
+            println!("  {}", "SELECT * FROM name WHERE col = value".dimmed());
+            println!(
+                "  {}",
+                "UPDATE name SET col = 'value' WHERE id = 1".dimmed()
+            );
+            println!("  {}", "DROP TABLE name".dimmed());
+            println!();
+            println!("{}", "Tips:".yellow().bold());
+            println!("  • Use {} for command history", "↑↓".cyan());
+            println!("  • Use {} for keyword completion", "Tab".cyan());
+            println!("  • Use {} to cancel input", "Ctrl+C".cyan());
+            println!("  • Use {} to exit", "Ctrl+D".cyan());
+        }
+        _ => println!("{} {}", "Unknown command:".red(), input),
+    }
+}
+
+fn print_result(result: ExecuteResult) {
+    match result {
+        ExecuteResult::TableCreated(name) => {
+            println!("{} Table '{}' created.", "✓".green().bold(), name.yellow());
+        }
+        ExecuteResult::TableDropped(name) => {
+            println!("{} Table '{}' dropped.", "✓".green().bold(), name.yellow());
+        }
+        ExecuteResult::RowsInserted(count) => {
+            println!(
+                "{} {} row(s) inserted.",
+                "✓".green().bold(),
+                count.to_string().cyan()
+            );
+        }
+        ExecuteResult::RowsDeleted(count) => {
+            println!(
+                "{} {} row(s) deleted.",
+                "✓".green().bold(),
+                count.to_string().cyan()
+            );
+        }
+        ExecuteResult::RowsUpdated(count) => {
+            println!(
+                "{} {} row(s) updated.",
+                "✓".green().bold(),
+                count.to_string().cyan()
+            );
+        }
+        ExecuteResult::Rows { headers, rows } => {
+            if rows.is_empty() {
+                println!("{}", "(empty result)".dimmed());
+            } else {
+                // Calculate column widths
+                let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+                for row in &rows {
+                    for (i, val) in row.iter().enumerate() {
+                        if i < widths.len() && val.len() > widths[i] {
+                            widths[i] = val.len();
+                        }
+                    }
+                }
+
+                // Print header separator
+                let separator: String = widths
+                    .iter()
+                    .map(|w| "─".repeat(w + 2))
+                    .collect::<Vec<_>>()
+                    .join("┼");
+                println!("┌{}┐", separator.replace('┼', "┬"));
+
+                // Print headers
+                let header_row: Vec<String> = headers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| format!("{:^width$}", h.yellow().bold(), width = widths[i]))
+                    .collect();
+                println!("│ {} │", header_row.join(" │ "));
+
+                println!("├{}┤", separator);
+
+                // Print data rows
+                for row in rows {
+                    let formatted: Vec<String> = row
+                        .iter()
+                        .enumerate()
+                        .map(|(i, val)| {
+                            let width = widths.get(i).copied().unwrap_or(val.len());
+                            format!("{:width$}", val.cyan(), width = width)
+                        })
+                        .collect();
+                    println!("│ {} │", formatted.join(" │ "));
+                }
+
+                println!("└{}┘", separator.replace('┼', "┴"));
+            }
         }
     }
 }

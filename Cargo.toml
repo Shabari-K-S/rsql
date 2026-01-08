@@ -1,6 +1,9 @@
 [package]
 name = "rsql"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+rustyline = "14"
+colored = "2"
+dirs = "5"

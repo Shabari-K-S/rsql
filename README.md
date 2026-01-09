@@ -123,7 +123,7 @@ History is saved to `~/.rsql_history`.
 - [x] SQL Parser (CREATE, INSERT, SELECT, UPDATE, DROP)
 - [x] WHERE clause support
 - [x] Enhanced REPL with history
-- [ ] DELETE statement
+- [x] DELETE statement
 - [ ] JOIN support
 - [ ] Transactions (BEGIN/COMMIT/ROLLBACK)
 - [ ] Secondary indexes

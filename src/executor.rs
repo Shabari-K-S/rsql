@@ -195,11 +195,9 @@ impl Executor {
 
         let count = ids_to_delete.len();
 
-        if count > 0 {
-            return Err(format!(
-                "DELETE not fully implemented. Would delete {} rows.",
-                count
-            ));
+        // Delete each matching row
+        for id in ids_to_delete {
+            table.delete(id)?;
         }
 
         Ok(ExecuteResult::RowsDeleted(count))

@@ -133,6 +133,35 @@ impl Table {
         Ok(())
     }
 
+    /// Delete a key from the B-Tree
+    pub fn delete(&mut self, key: u32) -> Result<(), String> {
+        let leaf_page_num = self.find_leaf(key);
+        let (slot, exists) = self.leaf_node_find(leaf_page_num, key);
+
+        if !exists {
+            return Err(format!("Key {} not found", key));
+        }
+
+        let page = self.pager.get_page(leaf_page_num as usize);
+        let num_cells = leaf_node_num_cells(page);
+
+        // Shift cells left to overwrite the deleted cell
+        if slot < num_cells - 1 {
+            let dst = leaf_node_cell(page, slot, self.cell_size);
+            let src = unsafe { dst.add(self.cell_size) };
+            let bytes_to_move = (num_cells - slot - 1) as usize * self.cell_size;
+            unsafe {
+                ptr::copy(src, dst, bytes_to_move);
+            }
+        }
+
+        // Decrement cell count
+        set_leaf_node_num_cells(page, num_cells - 1);
+        self.pager.flush(leaf_page_num as usize);
+
+        Ok(())
+    }
+
     fn leaf_node_insert(&mut self, page_num: u32, slot: u32, key: u32, row_data: &[u8]) {
         let page = self.pager.get_page(page_num as usize);
         let num_cells = leaf_node_num_cells(page);

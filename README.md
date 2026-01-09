@@ -125,7 +125,7 @@ History is saved to `~/.rsql_history`.
 - [x] Enhanced REPL with history
 - [x] DELETE statement
 - [x] JOIN support
-- [ ] Transactions (BEGIN/COMMIT/ROLLBACK)
+- [x] Transactions (BEGIN/COMMIT/ROLLBACK)
 - [ ] Secondary indexes
 - [ ] Variable-length records
 

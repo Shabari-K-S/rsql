@@ -10,6 +10,9 @@ pub enum Statement {
     Delete(DeleteStmt),
     Update(UpdateStmt),
     DropTable(String),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +154,18 @@ impl Parser {
             Token::Delete => self.parse_delete(),
             Token::Update => self.parse_update(),
             Token::Drop => self.parse_drop(),
+            Token::Begin => {
+                self.advance();
+                Ok(Statement::Begin)
+            }
+            Token::Commit => {
+                self.advance();
+                Ok(Statement::Commit)
+            }
+            Token::Rollback => {
+                self.advance();
+                Ok(Statement::Rollback)
+            }
             other => Err(format!("Unexpected token: {:?}", other)),
         }
     }

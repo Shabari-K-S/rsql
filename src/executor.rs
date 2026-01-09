@@ -7,12 +7,14 @@ use std::ptr;
 
 pub struct Executor {
     pub tables: std::collections::HashMap<String, Table>,
+    pub in_transaction: bool,
 }
 
 impl Executor {
     pub fn new() -> Self {
         Executor {
             tables: std::collections::HashMap::new(),
+            in_transaction: false,
         }
     }
 
@@ -24,7 +26,55 @@ impl Executor {
             Statement::Delete(delete) => self.execute_delete(delete),
             Statement::Update(update) => self.execute_update(update),
             Statement::DropTable(name) => self.execute_drop(name),
+            Statement::Begin => self.execute_begin(),
+            Statement::Commit => self.execute_commit(),
+            Statement::Rollback => self.execute_rollback(),
         }
+    }
+
+    fn execute_begin(&mut self) -> Result<ExecuteResult, String> {
+        if self.in_transaction {
+            return Err("Transaction already in progress".to_string());
+        }
+        self.in_transaction = true;
+        // Enable deferred flushing on all tables
+        for table in self.tables.values_mut() {
+            table.defer_flush = true;
+        }
+        Ok(ExecuteResult::TransactionStarted)
+    }
+
+    fn execute_commit(&mut self) -> Result<ExecuteResult, String> {
+        if !self.in_transaction {
+            return Err("No transaction in progress".to_string());
+        }
+        // Flush all pages to disk and disable deferred flushing
+        for table in self.tables.values_mut() {
+            table.pager.flush_all();
+            table.defer_flush = false;
+        }
+        self.in_transaction = false;
+        Ok(ExecuteResult::TransactionCommitted)
+    }
+
+    fn execute_rollback(&mut self) -> Result<ExecuteResult, String> {
+        if !self.in_transaction {
+            return Err("No transaction in progress".to_string());
+        }
+        // Discard in-memory pages by clearing and reloading from disk
+        for table in self.tables.values_mut() {
+            // Clear all cached pages
+            for i in 0..table.pager.pages.len() {
+                table.pager.pages[i] = None;
+            }
+            // Reset num_pages to what's actually on disk
+            let file_len = table.pager.file.metadata().map(|m| m.len()).unwrap_or(0);
+            table.pager.num_pages = (file_len / crate::pager::PAGE_SIZE as u64) as u32;
+            table.pager.file_length = file_len;
+            table.defer_flush = false;
+        }
+        self.in_transaction = false;
+        Ok(ExecuteResult::TransactionRolledBack)
     }
 
     fn execute_create(&mut self, stmt: CreateTableStmt) -> Result<ExecuteResult, String> {
@@ -525,6 +575,9 @@ pub enum ExecuteResult {
     RowsInserted(usize),
     RowsDeleted(usize),
     RowsUpdated(usize),
+    TransactionStarted,
+    TransactionCommitted,
+    TransactionRolledBack,
     Rows {
         headers: Vec<String>,
         rows: Vec<Vec<String>>,

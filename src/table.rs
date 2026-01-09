@@ -23,6 +23,7 @@ pub struct Table {
     pub row_size: usize,
     pub cell_size: usize,
     pub root_page_num: u32,
+    pub defer_flush: bool,
 }
 
 impl Table {
@@ -62,6 +63,7 @@ impl Table {
             row_size,
             cell_size,
             root_page_num: 0,
+            defer_flush: false,
         }
     }
 
@@ -157,7 +159,9 @@ impl Table {
 
         // Decrement cell count
         set_leaf_node_num_cells(page, num_cells - 1);
-        self.pager.flush(leaf_page_num as usize);
+        if !self.defer_flush {
+            self.pager.flush(leaf_page_num as usize);
+        }
 
         Ok(())
     }
@@ -188,7 +192,9 @@ impl Table {
         }
 
         set_leaf_node_num_cells(page, num_cells + 1);
-        self.pager.flush(page_num as usize);
+        if !self.defer_flush {
+            self.pager.flush(page_num as usize);
+        }
     }
 
     fn split_and_insert(&mut self, old_page_num: u32, key: u32, row_data: &[u8]) {

@@ -20,6 +20,9 @@ pub enum Token {
     Join,
     On,
     Inner,
+    Begin,
+    Commit,
+    Rollback,
 
     // Data types
     Integer,
@@ -206,6 +209,9 @@ impl Tokenizer {
                         "JOIN" => Token::Join,
                         "ON" => Token::On,
                         "INNER" => Token::Inner,
+                        "BEGIN" => Token::Begin,
+                        "COMMIT" => Token::Commit,
+                        "ROLLBACK" => Token::Rollback,
                         "INTEGER" | "INT" => Token::Integer,
                         "TEXT" | "VARCHAR" => Token::Text,
                         _ => Token::Identifier(ident),

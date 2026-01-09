@@ -237,6 +237,15 @@ fn print_result(result: ExecuteResult) {
                 count.to_string().cyan()
             );
         }
+        ExecuteResult::TransactionStarted => {
+            println!("{} Transaction started.", "✓".green().bold());
+        }
+        ExecuteResult::TransactionCommitted => {
+            println!("{} Transaction committed.", "✓".green().bold());
+        }
+        ExecuteResult::TransactionRolledBack => {
+            println!("{} Transaction rolled back.", "⟲".yellow().bold());
+        }
         ExecuteResult::Rows { headers, rows } => {
             if rows.is_empty() {
                 println!("{}", "(empty result)".dimmed());

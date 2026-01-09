@@ -48,7 +48,21 @@ pub enum Value {
 pub struct SelectStmt {
     pub columns: Vec<String>, // Empty = *, otherwise column names
     pub table_name: String,
+    pub joins: Vec<JoinClause>,
     pub where_clause: Option<WhereClause>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table_name: String,
+    pub left_column: String,
+    pub right_column: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum JoinType {
+    Inner,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +289,30 @@ impl Parser {
         self.expect(Token::From)?;
         let table_name = self.expect_identifier()?;
 
+        // Parse JOINs
+        let mut joins = Vec::new();
+        while *self.peek() == Token::Inner || *self.peek() == Token::Join {
+            // Handle optional INNER keyword
+            if *self.peek() == Token::Inner {
+                self.advance();
+            }
+            self.expect(Token::Join)?;
+
+            let join_table = self.expect_identifier()?;
+            self.expect(Token::On)?;
+
+            let left_column = self.expect_identifier()?;
+            self.expect(Token::Equals)?;
+            let right_column = self.expect_identifier()?;
+
+            joins.push(JoinClause {
+                join_type: JoinType::Inner,
+                table_name: join_table,
+                left_column,
+                right_column,
+            });
+        }
+
         let where_clause = if *self.peek() == Token::Where {
             Some(self.parse_where()?)
         } else {
@@ -284,6 +322,7 @@ impl Parser {
         Ok(Statement::Select(SelectStmt {
             columns,
             table_name,
+            joins,
             where_clause,
         }))
     }

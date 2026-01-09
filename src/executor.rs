@@ -94,6 +94,12 @@ impl Executor {
     }
 
     fn execute_select(&mut self, stmt: SelectStmt) -> Result<ExecuteResult, String> {
+        // Check if we have joins
+        if !stmt.joins.is_empty() {
+            return self.execute_select_with_join(stmt);
+        }
+
+        // Original single-table SELECT
         let table = self
             .tables
             .get_mut(&stmt.table_name)
@@ -101,20 +107,17 @@ impl Executor {
 
         let all_rows = table.select_all();
 
-        // Get column info - first column is always the primary key (stored as B-Tree key)
         let col_info: Vec<(String, usize, usize)> = table
             .columns
             .iter()
             .map(|c| (c.name.clone(), c.size, c.offset))
             .collect();
 
-        // The name of the first column (primary key)
         let pk_col_name = col_info
             .first()
             .map(|(name, _, _)| name.clone())
             .unwrap_or_default();
 
-        // Determine which columns to select
         let select_cols: Vec<String> = if stmt.columns.is_empty() {
             col_info.iter().map(|(name, _, _)| name.clone()).collect()
         } else {
@@ -122,7 +125,6 @@ impl Executor {
         };
 
         let headers: Vec<String> = select_cols.clone();
-
         let mut results: Vec<Vec<String>> = Vec::new();
 
         for (id, row_data) in all_rows {
@@ -133,10 +135,8 @@ impl Executor {
             }
 
             let mut row: Vec<String> = Vec::new();
-
             for col_name in &select_cols {
                 if col_name == &pk_col_name {
-                    // Primary key is stored as the B-Tree key, not in row_data
                     row.push(id.to_string());
                 } else if let Some((_, size, offset)) =
                     col_info.iter().find(|(name, _, _)| name == col_name)
@@ -150,12 +150,145 @@ impl Executor {
                     row.push(String::new());
                 }
             }
-
             results.push(row);
         }
 
         Ok(ExecuteResult::Rows {
             headers,
+            rows: results,
+        })
+    }
+
+    fn execute_select_with_join(&mut self, stmt: SelectStmt) -> Result<ExecuteResult, String> {
+        // Get the first join clause (supporting single join for now)
+        let join = stmt.joins.first().ok_or("No join clause found")?;
+        let left_table_name = stmt.table_name.clone();
+        let right_table_name = join.table_name.clone();
+        let left_col = join.left_column.clone();
+        let right_col = join.right_column.clone();
+
+        // Get left table data
+        let left_table = self
+            .tables
+            .get_mut(&left_table_name)
+            .ok_or_else(|| format!("Table '{}' not found", left_table_name))?;
+
+        let left_rows = left_table.select_all();
+        let left_col_info: Vec<(String, usize, usize)> = left_table
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.size, c.offset))
+            .collect();
+        let left_pk = left_col_info
+            .first()
+            .map(|(name, _, _)| name.clone())
+            .unwrap_or_default();
+
+        // Get right table data
+        let right_table = self
+            .tables
+            .get_mut(&right_table_name)
+            .ok_or_else(|| format!("Table '{}' not found", right_table_name))?;
+
+        let right_rows = right_table.select_all();
+        let right_col_info: Vec<(String, usize, usize)> = right_table
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.size, c.offset))
+            .collect();
+        let right_pk = right_col_info
+            .first()
+            .map(|(name, _, _)| name.clone())
+            .unwrap_or_default();
+
+        // Build combined column info with table prefixes for headers
+        let mut all_headers: Vec<String> = Vec::new();
+        let mut all_col_info: Vec<(String, String, usize, usize, bool)> = Vec::new(); // (col_name, table, size, offset, is_left)
+
+        for (name, size, offset) in &left_col_info {
+            all_headers.push(format!("{}.{}", left_table_name, name));
+            all_col_info.push((name.clone(), left_table_name.clone(), *size, *offset, true));
+        }
+        for (name, size, offset) in &right_col_info {
+            all_headers.push(format!("{}.{}", right_table_name, name));
+            all_col_info.push((
+                name.clone(),
+                right_table_name.clone(),
+                *size,
+                *offset,
+                false,
+            ));
+        }
+
+        // Determine which columns to select
+        let select_cols: Vec<String> = if stmt.columns.is_empty() {
+            all_headers.clone()
+        } else {
+            stmt.columns.clone()
+        };
+
+        let mut results: Vec<Vec<String>> = Vec::new();
+
+        // Nested-loop join
+        for (left_id, left_data) in &left_rows {
+            // Get left join column value
+            let left_val =
+                get_column_value(&left_col, *left_id, left_data, &left_col_info, &left_pk);
+
+            for (right_id, right_data) in &right_rows {
+                // Get right join column value
+                let right_val = get_column_value(
+                    &right_col,
+                    *right_id,
+                    right_data,
+                    &right_col_info,
+                    &right_pk,
+                );
+
+                // Check join condition
+                if left_val == right_val {
+                    let mut row: Vec<String> = Vec::new();
+
+                    for col_name in &select_cols {
+                        // Try to find column in the combined info
+                        if let Some((_, table, size, offset, is_left)) =
+                            all_col_info.iter().find(|(name, tbl, _, _, _)| {
+                                col_name == &format!("{}.{}", tbl, name) || col_name == name
+                            })
+                        {
+                            if *is_left {
+                                if col_name.contains(&left_pk) || col_name == &left_pk {
+                                    row.push(left_id.to_string());
+                                } else {
+                                    let data = &left_data[*offset..*offset + *size];
+                                    let s = String::from_utf8_lossy(data)
+                                        .trim_matches(char::from(0))
+                                        .to_string();
+                                    row.push(s);
+                                }
+                            } else {
+                                if col_name.contains(&right_pk) || col_name == &right_pk {
+                                    row.push(right_id.to_string());
+                                } else {
+                                    let data = &right_data[*offset..*offset + *size];
+                                    let s = String::from_utf8_lossy(data)
+                                        .trim_matches(char::from(0))
+                                        .to_string();
+                                    row.push(s);
+                                }
+                            }
+                        } else {
+                            row.push(String::new());
+                        }
+                    }
+
+                    results.push(row);
+                }
+            }
+        }
+
+        Ok(ExecuteResult::Rows {
+            headers: select_cols,
             rows: results,
         })
     }
@@ -363,6 +496,26 @@ fn evaluate_where(
     }
 
     final_result
+}
+
+// Helper function to get column value for JOIN condition
+fn get_column_value(
+    col_name: &str,
+    id: u32,
+    row_data: &[u8],
+    col_info: &[(String, usize, usize)],
+    pk_col_name: &str,
+) -> String {
+    if col_name == pk_col_name {
+        id.to_string()
+    } else if let Some((_, size, offset)) = col_info.iter().find(|(name, _, _)| name == col_name) {
+        let data = &row_data[*offset..*offset + *size];
+        String::from_utf8_lossy(data)
+            .trim_matches(char::from(0))
+            .to_string()
+    } else {
+        String::new()
+    }
 }
 
 #[derive(Debug)]

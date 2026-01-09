@@ -17,6 +17,9 @@ pub enum Token {
     Update,
     Set,
     Drop,
+    Join,
+    On,
+    Inner,
 
     // Data types
     Integer,
@@ -200,6 +203,9 @@ impl Tokenizer {
                         "UPDATE" => Token::Update,
                         "SET" => Token::Set,
                         "DROP" => Token::Drop,
+                        "JOIN" => Token::Join,
+                        "ON" => Token::On,
+                        "INNER" => Token::Inner,
                         "INTEGER" | "INT" => Token::Integer,
                         "TEXT" | "VARCHAR" => Token::Text,
                         _ => Token::Identifier(ident),

@@ -1,35 +1,270 @@
 //! SQL Query Executor - Executes parsed SQL statements
 
 use crate::btree::*;
+use crate::index::Index;
 use crate::parser::*;
 use crate::table::{DataType, Table};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::ptr;
 
 pub struct Executor {
-    pub tables: std::collections::HashMap<String, Table>,
+    pub tables: HashMap<String, Table>,
     pub in_transaction: bool,
+    pub current_db: Option<String>,
+    pub db_base_path: PathBuf,
 }
 
 impl Executor {
     pub fn new() -> Self {
+        let db_base_path = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".rsql")
+            .join("databases");
+
+        // Create base directory if it doesn't exist
+        let _ = std::fs::create_dir_all(&db_base_path);
+
         Executor {
-            tables: std::collections::HashMap::new(),
+            tables: HashMap::new(),
             in_transaction: false,
+            current_db: None,
+            db_base_path,
         }
+    }
+
+    /// Get the current database path, if connected
+    pub fn get_db_path(&self) -> Option<PathBuf> {
+        self.current_db
+            .as_ref()
+            .map(|db| self.db_base_path.join(db))
+    }
+
+    /// Require a database connection for operations
+    fn require_connection(&self) -> Result<PathBuf, String> {
+        self.get_db_path()
+            .ok_or_else(|| "No database connected. Use: CONNECT db_name".to_string())
     }
 
     pub fn execute(&mut self, stmt: Statement) -> Result<ExecuteResult, String> {
         match stmt {
+            Statement::CreateDatabase(name) => self.execute_create_database(name),
+            Statement::Connect(name) => self.execute_connect(name),
             Statement::CreateTable(create) => self.execute_create(create),
+            Statement::CreateIndex(create_idx) => self.execute_create_index(create_idx),
             Statement::Insert(insert) => self.execute_insert(insert),
             Statement::Select(select) => self.execute_select(select),
             Statement::Delete(delete) => self.execute_delete(delete),
             Statement::Update(update) => self.execute_update(update),
             Statement::DropTable(name) => self.execute_drop(name),
+            Statement::DropIndex(name) => self.execute_drop_index(name),
             Statement::Begin => self.execute_begin(),
             Statement::Commit => self.execute_commit(),
             Statement::Rollback => self.execute_rollback(),
         }
+    }
+
+    fn execute_create_database(&mut self, name: String) -> Result<ExecuteResult, String> {
+        let db_path = self.db_base_path.join(&name);
+
+        if db_path.exists() {
+            return Err(format!("Database '{}' already exists", name));
+        }
+
+        std::fs::create_dir_all(&db_path)
+            .map_err(|e| format!("Failed to create database: {}", e))?;
+
+        // Create empty metadata file
+        let metadata_path = db_path.join("metadata.json");
+        std::fs::write(&metadata_path, "{\"tables\":{}}")
+            .map_err(|e| format!("Failed to create metadata: {}", e))?;
+
+        Ok(ExecuteResult::DatabaseCreated(name))
+    }
+
+    fn execute_connect(&mut self, name: String) -> Result<ExecuteResult, String> {
+        let db_path = self.db_base_path.join(&name);
+
+        if !db_path.exists() {
+            return Err(format!(
+                "Database '{}' does not exist. Use: CREATE DATABASE {}",
+                name, name
+            ));
+        }
+
+        // Clear existing tables
+        self.tables.clear();
+        self.current_db = Some(name.clone());
+
+        // Load metadata and restore tables
+        self.load_metadata()?;
+
+        Ok(ExecuteResult::DatabaseConnected(name))
+    }
+
+    fn save_metadata(&self) -> Result<(), String> {
+        let db_path = match self.get_db_path() {
+            Some(p) => p,
+            None => return Ok(()), // No database connected, nothing to save
+        };
+
+        let metadata_path = db_path.join("metadata.json");
+
+        // Build metadata JSON
+        let mut tables_json = String::from("{\"tables\":{");
+        let mut first = true;
+
+        for (name, table) in &self.tables {
+            if !first {
+                tables_json.push(',');
+            }
+            first = false;
+
+            tables_json.push_str(&format!("\"{}\":{{\"columns\":[", name));
+
+            let mut col_first = true;
+            for col in &table.columns {
+                if !col_first {
+                    tables_json.push(',');
+                }
+                col_first = false;
+
+                let type_str = match &col.data_type {
+                    DataType::Integer => "\"INTEGER\"".to_string(),
+                    DataType::Text(size) => format!("\"TEXT({})\"", size),
+                };
+                tables_json.push_str(&format!(
+                    "{{\"name\":\"{}\",\"type\":{}}}",
+                    col.name, type_str
+                ));
+            }
+
+            tables_json.push_str("],\"indexes\":[");
+
+            let mut idx_first = true;
+            for (idx_name, idx) in &table.indexes {
+                if !idx_first {
+                    tables_json.push(',');
+                }
+                idx_first = false;
+                tables_json.push_str(&format!(
+                    "{{\"name\":\"{}\",\"column\":\"{}\",\"unique\":{}}}",
+                    idx_name, idx.column_name, idx.unique
+                ));
+            }
+
+            tables_json.push_str("]}");
+        }
+
+        tables_json.push_str("}}");
+
+        std::fs::write(&metadata_path, &tables_json)
+            .map_err(|e| format!("Failed to save metadata: {}", e))?;
+
+        Ok(())
+    }
+
+    fn load_metadata(&mut self) -> Result<(), String> {
+        let db_path = match self.get_db_path() {
+            Some(p) => p,
+            None => return Err("No database connected".to_string()),
+        };
+
+        let metadata_path = db_path.join("metadata.json");
+
+        if !metadata_path.exists() {
+            return Ok(()); // No metadata yet
+        }
+
+        let content = std::fs::read_to_string(&metadata_path)
+            .map_err(|e| format!("Failed to read metadata: {}", e))?;
+
+        // Simple JSON parsing (avoiding external dependencies)
+        // Format: {"tables":{"tablename":{"columns":[{"name":"col","type":"INTEGER"}],"indexes":[]}}}
+
+        // Extract table entries
+        if let Some(tables_start) = content.find("\"tables\":{") {
+            let tables_content = &content[tables_start + 10..];
+
+            // Parse each table
+            let mut pos = 0;
+            while let Some(name_start) = tables_content[pos..].find('"') {
+                let actual_start = pos + name_start + 1;
+                if let Some(name_end) = tables_content[actual_start..].find('"') {
+                    let table_name = &tables_content[actual_start..actual_start + name_end];
+
+                    if table_name == "}" || table_name.is_empty() {
+                        break;
+                    }
+
+                    // Find columns array
+                    if let Some(cols_start) = tables_content[actual_start..].find("\"columns\":[") {
+                        let cols_section = &tables_content[actual_start + cols_start..];
+
+                        // Parse columns
+                        let mut columns: Vec<(&str, DataType)> = Vec::new();
+                        let mut col_pos = 11; // After "columns":[
+
+                        while let Some(col_start) = cols_section[col_pos..].find("{\"name\":\"") {
+                            let cn_start = col_pos + col_start + 9;
+                            if let Some(cn_end) = cols_section[cn_start..].find('"') {
+                                let col_name = &cols_section[cn_start..cn_start + cn_end];
+
+                                // Find type
+                                let type_start = cn_start + cn_end;
+                                if let Some(t_start) = cols_section[type_start..].find("\"type\":")
+                                {
+                                    let t_section = &cols_section[type_start + t_start + 7..];
+
+                                    let data_type = if t_section.starts_with("\"INTEGER\"") {
+                                        DataType::Integer
+                                    } else if t_section.starts_with("\"TEXT(") {
+                                        // Extract size
+                                        if let Some(size_end) = t_section[6..].find(')') {
+                                            let size: u32 =
+                                                t_section[6..6 + size_end].parse().unwrap_or(255);
+                                            DataType::Text(size)
+                                        } else {
+                                            DataType::Text(255)
+                                        }
+                                    } else {
+                                        DataType::Text(255)
+                                    };
+
+                                    columns.push((
+                                        Box::leak(col_name.to_string().into_boxed_str()),
+                                        data_type,
+                                    ));
+                                }
+                            }
+                            col_pos = cn_start + 1;
+
+                            // Check if we've reached the end of columns array
+                            if cols_section[col_pos..].starts_with(']') {
+                                break;
+                            }
+                        }
+
+                        if !columns.is_empty() {
+                            // Create table from stored data
+                            let table_file = db_path.join(format!("{}.db", table_name));
+                            let table = Table::new(table_file.to_str().unwrap(), columns);
+                            self.tables.insert(table_name.to_string(), table);
+                        }
+                    }
+
+                    // Move to next table
+                    pos = actual_start + name_end + 1;
+                    if let Some(next) = tables_content[pos..].find('}') {
+                        pos += next + 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn execute_begin(&mut self) -> Result<ExecuteResult, String> {
@@ -78,6 +313,8 @@ impl Executor {
     }
 
     fn execute_create(&mut self, stmt: CreateTableStmt) -> Result<ExecuteResult, String> {
+        let db_path = self.require_connection()?;
+
         if self.tables.contains_key(&stmt.table_name) {
             return Err(format!("Table '{}' already exists", stmt.table_name));
         }
@@ -94,12 +331,15 @@ impl Executor {
             })
             .collect();
 
-        let filename = format!("{}.db", stmt.table_name);
+        let filename = db_path.join(format!("{}.db", stmt.table_name));
         let _ = std::fs::remove_file(&filename);
 
-        let table = Table::new(&filename, raw_cols);
+        let table = Table::new(filename.to_str().unwrap(), raw_cols);
         let table_name = stmt.table_name.clone();
         self.tables.insert(stmt.table_name, table);
+
+        // Save metadata
+        self.save_metadata()?;
 
         Ok(ExecuteResult::TableCreated(table_name))
     }
@@ -122,6 +362,13 @@ impl Executor {
 
         let mut row_data = vec![0u8; table.row_size];
 
+        // Build column info for value extraction
+        let col_info: Vec<(String, usize, usize)> = table
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.size, c.offset))
+            .collect();
+
         for (i, col) in table.columns.iter().enumerate() {
             if col.name == "id" || i == 0 {
                 continue;
@@ -139,7 +386,54 @@ impl Executor {
             }
         }
 
+        // Check UNIQUE constraints on all indexes BEFORE inserting
+        for index in table.indexes.values_mut() {
+            if index.unique {
+                // Get the value for this indexed column
+                let col_value = if let Some((_, size, offset)) = col_info
+                    .iter()
+                    .find(|(name, _, _)| *name == index.column_name)
+                {
+                    let data = &row_data[*offset..*offset + *size];
+                    String::from_utf8_lossy(data)
+                        .trim_matches(char::from(0))
+                        .to_string()
+                } else {
+                    continue;
+                };
+
+                // Check if value already exists in index
+                let existing = index.find(&col_value);
+                if !existing.is_empty() {
+                    return Err(format!(
+                        "UNIQUE constraint failed: column '{}' value '{}' already exists",
+                        index.column_name, col_value
+                    ));
+                }
+            }
+        }
+
+        // Insert into main table
         table.insert(id, &row_data)?;
+
+        // Update all indexes with the new row
+        for index in table.indexes.values_mut() {
+            let col_value = if let Some((_, size, offset)) = col_info
+                .iter()
+                .find(|(name, _, _)| *name == index.column_name)
+            {
+                let data = &row_data[*offset..*offset + *size];
+                String::from_utf8_lossy(data)
+                    .trim_matches(char::from(0))
+                    .to_string()
+            } else {
+                continue;
+            };
+
+            // Insert into index (ignore errors since we already validated uniqueness)
+            let _ = index.insert(&col_value, id);
+        }
+
         Ok(ExecuteResult::RowsInserted(1))
     }
 
@@ -465,6 +759,84 @@ impl Executor {
             Err(format!("Table '{}' not found", table_name))
         }
     }
+
+    fn execute_create_index(&mut self, stmt: CreateIndexStmt) -> Result<ExecuteResult, String> {
+        let table = self
+            .tables
+            .get_mut(&stmt.table_name)
+            .ok_or_else(|| format!("Table '{}' not found", stmt.table_name))?;
+
+        // Check if column exists
+        let col_exists = table.columns.iter().any(|c| c.name == stmt.column_name);
+        if !col_exists {
+            return Err(format!(
+                "Column '{}' not found in table '{}'",
+                stmt.column_name, stmt.table_name
+            ));
+        }
+
+        // Check if index already exists
+        if table.indexes.contains_key(&stmt.index_name) {
+            return Err(format!("Index '{}' already exists", stmt.index_name));
+        }
+
+        // Create the index
+        let mut index = Index::new(
+            &stmt.index_name,
+            &stmt.table_name,
+            &stmt.column_name,
+            stmt.unique,
+        );
+
+        // Get column info for extracting values
+        let col_info: Vec<(String, usize, usize)> = table
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.size, c.offset))
+            .collect();
+        let pk_col_name = col_info
+            .first()
+            .map(|(name, _, _)| name.clone())
+            .unwrap_or_default();
+
+        // Populate index with existing data
+        let all_rows = table.select_all();
+        for (row_id, row_data) in all_rows {
+            let col_value = if stmt.column_name == pk_col_name {
+                row_id.to_string()
+            } else if let Some((_, size, offset)) = col_info
+                .iter()
+                .find(|(name, _, _)| *name == stmt.column_name)
+            {
+                let data = &row_data[*offset..*offset + *size];
+                String::from_utf8_lossy(data)
+                    .trim_matches(char::from(0))
+                    .to_string()
+            } else {
+                continue;
+            };
+
+            index.insert(&col_value, row_id)?;
+        }
+
+        let index_name = stmt.index_name.clone();
+        table.indexes.insert(stmt.index_name, index);
+
+        Ok(ExecuteResult::IndexCreated(index_name))
+    }
+
+    fn execute_drop_index(&mut self, index_name: String) -> Result<ExecuteResult, String> {
+        // Find and remove the index from any table
+        for table in self.tables.values_mut() {
+            if let Some(index) = table.indexes.remove(&index_name) {
+                // Delete the index file
+                let filename = format!("{}_{}.idx", index.table_name, index_name);
+                let _ = std::fs::remove_file(&filename);
+                return Ok(ExecuteResult::IndexDropped(index_name));
+            }
+        }
+        Err(format!("Index '{}' not found", index_name))
+    }
 }
 
 // Standalone function to avoid borrow checker issues
@@ -570,8 +942,12 @@ fn get_column_value(
 
 #[derive(Debug)]
 pub enum ExecuteResult {
+    DatabaseCreated(String),
+    DatabaseConnected(String),
     TableCreated(String),
     TableDropped(String),
+    IndexCreated(String),
+    IndexDropped(String),
     RowsInserted(usize),
     RowsDeleted(usize),
     RowsUpdated(usize),

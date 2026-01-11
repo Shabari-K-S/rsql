@@ -35,7 +35,8 @@ const SQL_KEYWORDS: &[&str] = &[
     "VALUES", "SET", "AND", "OR", "NOT", "INTEGER", "TEXT", "VARCHAR", "PRIMARY", "KEY", "NULL",
     "DEFAULT", "ORDER", "BY", "ASC", "DESC", "LIMIT", "OFFSET", "JOIN", "ON", "LEFT", "RIGHT",
     "INNER", "OUTER", "GROUP", "HAVING", "COUNT", "SUM", "AVG", "MIN", "MAX", "DISTINCT", "AS",
-    "LIKE", "IN", "BETWEEN", "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
+    "LIKE", "IN", "BETWEEN", "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END", "INDEX", "UNIQUE",
+    "BEGIN", "COMMIT", "ROLLBACK", "DATABASE", "CONNECT",
 ];
 
 impl Completer for SqlCompleter {

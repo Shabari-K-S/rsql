@@ -5,11 +5,15 @@ use crate::tokenizer::Token;
 #[derive(Debug, Clone)]
 pub enum Statement {
     CreateTable(CreateTableStmt),
+    CreateIndex(CreateIndexStmt),
+    CreateDatabase(String),
+    Connect(String),
     Insert(InsertStmt),
     Select(SelectStmt),
     Delete(DeleteStmt),
     Update(UpdateStmt),
     DropTable(String),
+    DropIndex(String),
     Begin,
     Commit,
     Rollback,
@@ -19,6 +23,14 @@ pub enum Statement {
 pub struct CreateTableStmt {
     pub table_name: String,
     pub columns: Vec<ColumnDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateIndexStmt {
+    pub index_name: String,
+    pub table_name: String,
+    pub column_name: String,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -166,12 +178,37 @@ impl Parser {
                 self.advance();
                 Ok(Statement::Rollback)
             }
+            Token::Connect => {
+                self.advance();
+                let db_name = self.expect_identifier()?;
+                Ok(Statement::Connect(db_name))
+            }
             other => Err(format!("Unexpected token: {:?}", other)),
         }
     }
 
     fn parse_create(&mut self) -> Result<Statement, String> {
         self.advance(); // consume CREATE
+
+        // Check for UNIQUE INDEX or INDEX
+        let is_unique = if *self.peek() == Token::Unique {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        if *self.peek() == Token::Index || is_unique {
+            return self.parse_create_index(is_unique);
+        }
+
+        // Check for CREATE DATABASE
+        if *self.peek() == Token::Database {
+            self.advance();
+            let db_name = self.expect_identifier()?;
+            return Ok(Statement::CreateDatabase(db_name));
+        }
+
         self.expect(Token::Table)?;
 
         let table_name = self.expect_identifier()?;
@@ -399,9 +436,33 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Statement, String> {
         self.advance(); // consume DROP
+
+        if *self.peek() == Token::Index {
+            self.advance(); // consume INDEX
+            let index_name = self.expect_identifier()?;
+            return Ok(Statement::DropIndex(index_name));
+        }
+
         self.expect(Token::Table)?;
         let table_name = self.expect_identifier()?;
         Ok(Statement::DropTable(table_name))
+    }
+
+    fn parse_create_index(&mut self, unique: bool) -> Result<Statement, String> {
+        self.expect(Token::Index)?;
+        let index_name = self.expect_identifier()?;
+        self.expect(Token::On)?;
+        let table_name = self.expect_identifier()?;
+        self.expect(Token::LeftParen)?;
+        let column_name = self.expect_identifier()?;
+        self.expect(Token::RightParen)?;
+
+        Ok(Statement::CreateIndex(CreateIndexStmt {
+            index_name,
+            table_name,
+            column_name,
+            unique,
+        }))
     }
 
     fn parse_where(&mut self) -> Result<WhereClause, String> {

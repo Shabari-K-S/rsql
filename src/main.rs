@@ -1,6 +1,7 @@
 mod btree;
 mod completer;
 mod executor;
+mod index;
 mod pager;
 mod parser;
 mod table;
@@ -60,7 +61,10 @@ fn main() {
     println!();
 
     loop {
-        let prompt = "rsql> ".green().bold().to_string();
+        let prompt = match &executor.current_db {
+            Some(db) => format!("rsql[{}]> ", db).green().bold().to_string(),
+            None => "rsql> ".yellow().to_string(),
+        };
 
         match rl.readline(&prompt) {
             Ok(line) => {
@@ -177,7 +181,9 @@ fn handle_meta_command(
         ".help" => {
             println!("{}", "Meta Commands:".yellow().bold());
             println!("  {}  - Show this help", ".help".cyan());
+            println!("  {}  - List all databases", ".databases".cyan());
             println!("  {}  - List all tables", ".tables".cyan());
+            println!("  {}  - List all indexes", ".indexes".cyan());
             println!("  {}  - Show table schemas", ".schema".cyan());
             println!("  {}  - Exit the shell", ".exit".cyan());
             println!();
@@ -204,17 +210,84 @@ fn handle_meta_command(
             println!("  • Use {} to cancel input", "Ctrl+C".cyan());
             println!("  • Use {} to exit", "Ctrl+D".cyan());
         }
+        ".indexes" => {
+            let mut found = false;
+            for (table_name, table) in &executor.tables {
+                for (idx_name, idx) in &table.indexes {
+                    found = true;
+                    let unique_str = if idx.unique { " UNIQUE" } else { "" };
+                    println!(
+                        "  {}{} ON {}({})",
+                        idx_name.yellow(),
+                        unique_str.magenta(),
+                        table_name.cyan(),
+                        idx.column_name.cyan()
+                    );
+                }
+            }
+            if !found {
+                println!("{}", "(no indexes)".dimmed());
+            }
+        }
+        ".databases" => {
+            let base_path = &executor.db_base_path;
+            if base_path.exists() {
+                match std::fs::read_dir(base_path) {
+                    Ok(entries) => {
+                        let mut found = false;
+                        for entry in entries.flatten() {
+                            if entry.path().is_dir() {
+                                found = true;
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                let marker = if executor.current_db.as_ref() == Some(&name) {
+                                    "*"
+                                } else {
+                                    " "
+                                };
+                                println!(" {} {}", marker.green(), name.yellow());
+                            }
+                        }
+                        if !found {
+                            println!("{}", "(no databases)".dimmed());
+                        }
+                    }
+                    Err(_) => println!("{}", "(no databases)".dimmed()),
+                }
+            } else {
+                println!("{}", "(no databases)".dimmed());
+            }
+        }
         _ => println!("{} {}", "Unknown command:".red(), input),
     }
 }
 
 fn print_result(result: ExecuteResult) {
     match result {
+        ExecuteResult::DatabaseCreated(name) => {
+            println!(
+                "{} Database '{}' created.",
+                "✓".green().bold(),
+                name.yellow()
+            );
+        }
+        ExecuteResult::DatabaseConnected(name) => {
+            println!(
+                "{} Connected to database '{}'.",
+                "✓".green().bold(),
+                name.yellow()
+            );
+        }
         ExecuteResult::TableCreated(name) => {
             println!("{} Table '{}' created.", "✓".green().bold(), name.yellow());
         }
         ExecuteResult::TableDropped(name) => {
             println!("{} Table '{}' dropped.", "✓".green().bold(), name.yellow());
+        }
+        ExecuteResult::IndexCreated(name) => {
+            println!("{} Index '{}' created.", "✓".green().bold(), name.yellow());
+        }
+        ExecuteResult::IndexDropped(name) => {
+            println!("{} Index '{}' dropped.", "✓".green().bold(), name.yellow());
         }
         ExecuteResult::RowsInserted(count) => {
             println!(

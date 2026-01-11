@@ -1,7 +1,9 @@
 //! Table and Row handling
 
 use crate::btree::*;
+use crate::index::Index;
 use crate::pager::{Pager, PAGE_SIZE};
+use std::collections::HashMap;
 use std::ptr;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +26,7 @@ pub struct Table {
     pub cell_size: usize,
     pub root_page_num: u32,
     pub defer_flush: bool,
+    pub indexes: HashMap<String, Index>,
 }
 
 impl Table {
@@ -64,6 +67,7 @@ impl Table {
             cell_size,
             root_page_num: 0,
             defer_flush: false,
+            indexes: HashMap::new(),
         }
     }
 
@@ -431,102 +435,4 @@ impl Table {
 
         results
     }
-
-    /// Print B-Tree structure for debugging
-    pub fn print_tree(&mut self) {
-        println!("\n=== B-Tree Structure ===");
-        self.print_node(self.root_page_num, 0);
-        println!("========================\n");
-    }
-
-    fn print_node(&mut self, page_num: u32, indent: usize) {
-        let prefix = "  ".repeat(indent);
-
-        // Collect all data we need from this page first
-        let (node_type, is_root, node_info) = {
-            let page = self.pager.get_page(page_num as usize);
-            let node_type = get_node_type(page);
-            let is_root = is_node_root(page);
-
-            let info = match node_type {
-                NodeType::Leaf => {
-                    let num_cells = leaf_node_num_cells(page);
-                    let mut keys = Vec::new();
-                    for i in 0..num_cells.min(5) {
-                        keys.push(leaf_node_key(page, i, self.cell_size));
-                    }
-                    NodeInfo::Leaf { num_cells, keys }
-                }
-                NodeType::Internal => {
-                    let num_keys = internal_node_num_keys(page);
-                    let mut children_and_keys = Vec::new();
-                    for i in 0..num_keys {
-                        let child = internal_node_child(page, i);
-                        let key = internal_node_key(page, i);
-                        children_and_keys.push((child, key));
-                    }
-                    let right_child = internal_node_right_child(page);
-                    NodeInfo::Internal {
-                        num_keys,
-                        children_and_keys,
-                        right_child,
-                    }
-                }
-            };
-
-            (node_type, is_root, info)
-        };
-
-        // Now print and recurse (no longer borrowing page)
-        match node_info {
-            NodeInfo::Leaf { num_cells, keys } => {
-                println!(
-                    "{}Leaf (page {}, {} cells{})",
-                    prefix,
-                    page_num,
-                    num_cells,
-                    if is_root { ", ROOT" } else { "" }
-                );
-                for key in &keys {
-                    println!("{}  - key {}", prefix, key);
-                }
-                if num_cells > 5 {
-                    println!("{}  ... and {} more", prefix, num_cells - 5);
-                }
-            }
-            NodeInfo::Internal {
-                num_keys,
-                children_and_keys,
-                right_child,
-            } => {
-                println!(
-                    "{}Internal (page {}, {} keys{})",
-                    prefix,
-                    page_num,
-                    num_keys,
-                    if is_root { ", ROOT" } else { "" }
-                );
-
-                for (child, key) in children_and_keys {
-                    self.print_node(child, indent + 1);
-                    println!("{}  [key {}]", prefix, key);
-                }
-
-                self.print_node(right_child, indent + 1);
-            }
-        }
-    }
-}
-
-// Helper enum to store node info for print_node
-enum NodeInfo {
-    Leaf {
-        num_cells: u32,
-        keys: Vec<u32>,
-    },
-    Internal {
-        num_keys: u32,
-        children_and_keys: Vec<(u32, u32)>,
-        right_child: u32,
-    },
 }

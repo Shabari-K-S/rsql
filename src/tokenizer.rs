@@ -23,6 +23,10 @@ pub enum Token {
     Begin,
     Commit,
     Rollback,
+    Index,
+    Unique,
+    Database,
+    Connect,
 
     // Data types
     Integer,
@@ -212,6 +216,10 @@ impl Tokenizer {
                         "BEGIN" => Token::Begin,
                         "COMMIT" => Token::Commit,
                         "ROLLBACK" => Token::Rollback,
+                        "INDEX" => Token::Index,
+                        "UNIQUE" => Token::Unique,
+                        "DATABASE" => Token::Database,
+                        "CONNECT" => Token::Connect,
                         "INTEGER" | "INT" => Token::Integer,
                         "TEXT" | "VARCHAR" => Token::Text,
                         _ => Token::Identifier(ident),
